@@ -20,7 +20,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+
+	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
 )
 
 type driver struct {
@@ -30,6 +33,7 @@ type driver struct {
 
 	region       string
 	volumeMapDir string
+	volumeLocks  *utils.VolumeLocks
 
 	idServer         *IdentityServer
 	nodeServer       *NodeServer
@@ -37,6 +41,8 @@ type driver struct {
 
 	cap   []*csi.VolumeCapability_AccessMode
 	cscap []*csi.ControllerServiceCapability
+
+	kubeClient kubernetes.Interface
 }
 
 // NewDriver create the identity/node
@@ -47,17 +53,30 @@ func NewDriver(conf *GlobalConfig) *driver {
 	}
 
 	klog.Infof("Driver: %v version: %v", conf.DriverName, conf.Version)
+
+	// Create kubernetes client
+	kubeClient, err := utils.GetK8sClient()
+	if err != nil {
+		klog.Fatalf("Failed to create kubernetes client: %v", err)
+		return nil
+	}
+
 	return &driver{
 		name:         conf.DriverName,
 		version:      conf.Version,
 		nodeId:       conf.NodeID,
 		region:       conf.Region,
 		volumeMapDir: conf.NVMfVolumeMapDir,
+		volumeLocks:  utils.NewVolumeLocks(),
+		kubeClient:   kubeClient,
 	}
 }
 
 func (d *driver) Run(conf *GlobalConfig) {
-	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{})
+	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+	})
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 	})

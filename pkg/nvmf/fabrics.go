@@ -23,55 +23,62 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
 	"k8s.io/klog/v2"
 )
 
 type Connector struct {
-	VolumeID      string
-	DeviceUUID    string
-	TargetNqn     string
-	TargetAddr    string
-	TargetPort    string
-	Transport     string
-	HostNqn       string
-	RetryCount    int32
-	CheckInterval int32
+	VolumeID        string
+	TargetNqn       string
+	TargetEndpoints []string
+	Transport       string
+	HostNqn         string
+	RetryCount      int32
+	CheckInterval   int32
 }
 
 func getNvmfConnector(nvmfInfo *nvmfDiskInfo, hostnqn string) *Connector {
 	return &Connector{
-		VolumeID:   nvmfInfo.VolName,
-		DeviceUUID: nvmfInfo.DeviceUUID,
-		TargetNqn:  nvmfInfo.Nqn,
-		TargetAddr: nvmfInfo.Addr,
-		TargetPort: nvmfInfo.Port,
-		Transport:  nvmfInfo.Transport,
-		HostNqn:    hostnqn,
+		VolumeID:        nvmfInfo.VolName,
+		TargetNqn:       nvmfInfo.Nqn,
+		TargetEndpoints: nvmfInfo.Endpoints,
+		Transport:       nvmfInfo.Transport,
+		HostNqn:         hostnqn,
+		RetryCount:      10, // Default retry count
+		CheckInterval:   1,  // Default check interval in seconds
 	}
 }
 
 // connector provides a struct to hold all of the needed parameters to make nvmf connection
 
-func _connect(argStr string) error {
-	file, err := os.OpenFile("/dev/nvme-fabrics", os.O_RDWR, 0666)
-	if err != nil {
-		klog.Errorf("Connect: open NVMf fabrics error: %v", err)
-		return err
+func _connect(argStr string, maxRetries, intervalSeconds int32) error {
+	var err error
+	for i := int32(0); i < maxRetries; i++ {
+		time.Sleep(time.Second * time.Duration(intervalSeconds))
+		file, err := os.OpenFile("/dev/nvme-fabrics", os.O_RDWR, 0666)
+		if err != nil {
+			klog.Warningf("_connect: attempt %d/%d for '%s', error opening /dev/nvme-fabrics: %v", i+1, maxRetries, argStr, err)
+			continue
+		}
+
+		defer file.Close()
+		err = utils.WriteStringToFile(file, argStr)
+		if err != nil {
+			klog.Warningf("_connect: attempt %d/%d to write arg for '%s' failed: %v", i+1, maxRetries, argStr, err)
+			continue
+		}
+
+		// todo: read file to verify
+		lines, _ := utils.ReadLinesFromFile(file)
+		klog.Infof("Connect: read string %s", lines)
+
+		return nil
 	}
 
-	defer file.Close()
-
-	err = utils.WriteStringToFile(file, argStr)
-	if err != nil {
-		klog.Errorf("Connect: write arg to connect file error: %v", err)
-		return err
-	}
-	// todo: read file to verify
-	lines, _ := utils.ReadLinesFromFile(file)
-	klog.Infof("Connect: read string %s", lines)
-	return nil
+	klog.Errorf("Connect: failed to connect after %d attempts", maxRetries)
+	return err
 }
 
 func _disconnect(sysfs_path string) error {
@@ -228,13 +235,6 @@ func disconnectByNqn(nqn, hostnqn string) int {
 
 // connect to volume to this node and return devicePath
 func (c *Connector) Connect() (string, error) {
-	if c.RetryCount == 0 {
-		c.RetryCount = 10
-	}
-	if c.CheckInterval == 0 {
-		c.CheckInterval = 1
-	}
-
 	if c.RetryCount < 0 || c.CheckInterval < 0 {
 		return "", fmt.Errorf("Invalid RetryCount and CheckInterval combinaitons "+
 			"RetryCount: %d, CheckInterval: %d ", c.RetryCount, c.CheckInterval)
@@ -244,17 +244,39 @@ func (c *Connector) Connect() (string, error) {
 		return "", fmt.Errorf("csi transport only support tcp/rdma ")
 	}
 
-	baseString := fmt.Sprintf("nqn=%s,transport=%s,traddr=%s,trsvcid=%s,hostnqn=%s", c.TargetNqn, c.Transport, c.TargetAddr, c.TargetPort, c.HostNqn)
-	devicePath := strings.Join([]string{"/dev/disk/by-id/nvme-uuid", c.DeviceUUID}, ".")
+	// TargetEndpoints is assumed to be populated (via CreateVolume) with multiple "IP:Port" entries
+	// Attempt to connect to all endpoints to support multi-path configurations
+	for _, endpoint := range c.TargetEndpoints {
+		// Split the endpoint into IP and port
+		parts := strings.Split(endpoint, ":")
+		if len(parts) != 2 {
+			return "", fmt.Errorf("invalid endpoint format: %s", endpoint)
+		}
 
-	// connect to nvmf disk
-	err := _connect(baseString)
-	if err != nil {
-		return "", err
+		ip, port := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if ip == "" || port == "" {
+			return "", fmt.Errorf("empty IP or port in endpoint: %s", endpoint)
+		}
+
+		baseString := fmt.Sprintf("nqn=%s,transport=%s,traddr=%s,trsvcid=%s,hostnqn=%s", c.TargetNqn, c.Transport, ip, port, c.HostNqn)
+		klog.V(4).Infof("Running connect on %s://%s:%s", c.Transport, ip, port)
+
+		// connect to nvmf disk
+		err := _connect(baseString, c.RetryCount, c.CheckInterval)
+		if err != nil {
+			klog.Errorf("Connect: failed to connect to endpoint %s, error: %v", endpoint, err)
+			ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
+			if ret < 0 {
+				klog.Errorf("rollback error !!!")
+			}
+			return "", err
+		}
 	}
-	klog.Infof("Connect Volume %s success nqn: %s, hostnqn: %s", c.VolumeID, c.TargetNqn, c.HostNqn)
-	retries := int(c.RetryCount / c.CheckInterval)
-	if exists, err := waitForPathToExist(devicePath, retries, int(c.CheckInterval), c.Transport); !exists {
+	klog.V(4).Infof("Connect Volume %s success nqn: %s, hostnqn: %s", c.VolumeID, c.TargetNqn, c.HostNqn)
+
+	// Wait for device to be ready (find UUID and check path)
+	devicePath, err := findPathWithRetry(c.TargetNqn, c.RetryCount, c.CheckInterval)
+	if err != nil {
 		klog.Errorf("connect nqn %s error %v, rollback!!!", c.TargetNqn, err)
 		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 		if ret < 0 {
@@ -263,9 +285,8 @@ func (c *Connector) Connect() (string, error) {
 		return "", err
 	}
 
-	// create nqn directory
-	nqnPath := filepath.Join(RUN_NVMF, c.TargetNqn)
-	if err := os.MkdirAll(nqnPath, 0750); err != nil {
+	// create tracking files
+	if err := createTrackingFiles(c); err != nil {
 		klog.Errorf("create nqn directory %s error %v, rollback!!!", c.TargetNqn, err)
 		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 		if ret < 0 {
@@ -273,19 +294,6 @@ func (c *Connector) Connect() (string, error) {
 		}
 		return "", err
 	}
-
-	// create hostnqn file
-	hostnqnPath := filepath.Join(RUN_NVMF, c.TargetNqn, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
-	file, err := os.Create(hostnqnPath)
-	if err != nil {
-		klog.Errorf("create hostnqn file %s:%s error %v, rollback!!!", c.TargetNqn, c.HostNqn, err)
-		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
-		if ret < 0 {
-			klog.Errorf("rollback error !!!")
-		}
-		return "", err
-	}
-	defer file.Close()
 
 	klog.Infof("After connect we're returning devicePath: %s", devicePath)
 	return devicePath, nil
@@ -297,6 +305,25 @@ func (c *Connector) Disconnect() error {
 	if ret < 0 {
 		return fmt.Errorf("Disconnect: failed to disconnect by nqn: %s ", c.TargetNqn)
 	}
+
+	return nil
+}
+
+// createTrackingFiles creates tracking files used by the disconnect process
+func createTrackingFiles(c *Connector) error {
+	// create nqn directory
+	nqnPath := filepath.Join(RUN_NVMF, c.TargetNqn)
+	if err := os.MkdirAll(nqnPath, 0750); err != nil {
+		return fmt.Errorf("failed to create NQN directory: %v", err)
+	}
+
+	// create hostnqn file
+	hostnqnPath := filepath.Join(RUN_NVMF, c.TargetNqn, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
+	file, err := os.Create(hostnqnPath)
+	if err != nil {
+		klog.Errorf("create hostnqn file %s:%s error %v", c.TargetNqn, c.HostNqn, err)
+	}
+	defer file.Close()
 
 	return nil
 }
